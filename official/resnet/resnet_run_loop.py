@@ -23,6 +23,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
 import math
 import os
 
@@ -35,6 +36,7 @@ from official.utils.flags import core as flags_core
 from official.utils.export import export
 from official.utils.logs import hooks_helper
 from official.utils.logs import logger
+from official.resnet import imagenet_preprocessing
 from official.utils.misc import distribution_utils
 from official.utils.misc import model_helpers
 # pylint: enable=g-bad-import-order
@@ -66,36 +68,26 @@ def process_record_dataset(dataset, is_training, batch_size, shuffle_buffer,
     Dataset of (image, label) pairs ready for iteration.
   """
 
-  # We prefetch a batch at a time, This can help smooth out the time taken to
-  # load input files as we go through shuffling and processing.
+  # Sets tf.data to AUTOTUNE, e.g. num_parallel_batches in map_and_batch.
+  options = tf.data.Options()
+  options.experimental_autotune = True
+  dataset = dataset.with_options(options)
+
+  # Prefetches a batch at a time to smooth out the time taken to load input
+  # files for shuffling and processing.
   dataset = dataset.prefetch(buffer_size=batch_size)
   if is_training:
-    # Shuffle the records. Note that we shuffle before repeating to ensure
-    # that the shuffling respects epoch boundaries.
+    # Shuffles records before repeating to respect epoch boundaries.
     dataset = dataset.shuffle(buffer_size=shuffle_buffer)
 
-  # If we are training over multiple epochs before evaluating, repeat the
-  # dataset for the appropriate number of epochs.
+  # Repeats the dataset for the number of epochs to train.
   dataset = dataset.repeat(num_epochs)
 
-  if is_training and num_gpus and examples_per_epoch:
-    total_examples = num_epochs * examples_per_epoch
-    # Force the number of batches to be divisible by the number of devices.
-    # This prevents some devices from receiving batches while others do not,
-    # which can lead to a lockup. This case will soon be handled directly by
-    # distribution strategies, at which point this .take() operation will no
-    # longer be needed.
-    total_batches = total_examples // batch_size // num_gpus * num_gpus
-    dataset.take(total_batches * batch_size)
-
-  # Parse the raw records into images and labels. Testing has shown that setting
-  # num_parallel_batches > 1 produces no improvement in throughput, since
-  # batch_size is almost always much greater than the number of CPU cores.
+  # Parses the raw records into images and labels.
   dataset = dataset.apply(
       tf.contrib.data.map_and_batch(
           lambda value: parse_record_fn(value, is_training, dtype),
           batch_size=batch_size,
-          num_parallel_batches=1,
           drop_remainder=False))
 
   # Operations between the final prefetch and the get_next call to the iterator
@@ -152,6 +144,26 @@ def get_synth_input_fn(height, width, num_channels, num_classes,
     return data
 
   return input_fn
+
+
+def image_bytes_serving_input_fn(image_shape, dtype=tf.float32):
+  """Serving input fn for raw jpeg images."""
+
+  def _preprocess_image(image_bytes):
+    """Preprocess a single raw image."""
+    # Bounding box around the whole image.
+    bbox = tf.constant([0.0, 0.0, 1.0, 1.0], dtype=dtype, shape=[1, 1, 4])
+    height, width, num_channels = image_shape
+    image = imagenet_preprocessing.preprocess_image(
+        image_bytes, bbox, height, width, num_channels, is_training=False)
+    return image
+
+  image_bytes_list = tf.placeholder(
+      shape=[None], dtype=tf.string, name='input_tensor')
+  images = tf.map_fn(
+      _preprocess_image, image_bytes_list, back_prop=False, dtype=dtype)
+  return tf.estimator.export.TensorServingInputReceiver(
+      images, {'image_bytes': image_bytes_list})
 
 
 ################################################################################
@@ -508,9 +520,15 @@ def resnet_main(
 
   if flags_obj.export_dir is not None:
     # Exports a saved model for the given classifier.
-    input_receiver_fn = export.build_tensor_serving_input_receiver_fn(
-        shape, batch_size=flags_obj.batch_size)
-    classifier.export_savedmodel(flags_obj.export_dir, input_receiver_fn)
+    export_dtype = flags_core.get_tf_dtype(flags_obj)
+    if flags_obj.image_bytes_as_serving_input:
+      input_receiver_fn = functools.partial(
+          image_bytes_serving_input_fn, shape, dtype=export_dtype)
+    else:
+      input_receiver_fn = export.build_tensor_serving_input_receiver_fn(
+          shape, batch_size=flags_obj.batch_size, dtype=export_dtype)
+    classifier.export_savedmodel(flags_obj.export_dir, input_receiver_fn,
+                                 strip_default_attrs=True)
 
 
 def define_resnet_flags(resnet_size_choices=None):
@@ -539,6 +557,15 @@ def define_resnet_flags(resnet_size_choices=None):
       name='eval_only', default=False,
       help=flags_core.help_wrap('Skip training and only perform evaluation on '
                                 'the latest checkpoint.'))
+  flags.DEFINE_boolean(
+      name="image_bytes_as_serving_input", default=False,
+      help=flags_core.help_wrap(
+          'If True exports savedmodel with serving signature that accepts '
+          'JPEG image bytes instead of a fixed size [HxWxC] tensor that '
+          'represents the image. The former is easier to use for serving at '
+          'the expense of image resize/cropping being done as part of model '
+          'inference. Note, this flag only applies to ImageNet and cannot '
+          'be used for CIFAR.'))
 
   choice_kwargs = dict(
       name='resnet_size', short_name='rs', default='50',
